@@ -9,28 +9,27 @@ extension WorkflowNode {
 
         internal var onUpdate: ((Output) -> Void)? = nil
 
-        /// Signals from the outside world (e.g. UI)
-        private let (childEvent, childEventObserver) = Signal<Signal<Output, NoError>, NoError>.pipe()
+        /// Sinks from the outside world (i.e. UI)
+        private var sinks: [SinkContext] = []
 
         /// The current array of children
         private (set) internal var childWorkflows: [ChildKey:AnyChildWorkflow] = [:]
 
+        /// The current array of workers
         private (set) internal var childWorkers: [AnyChildWorker] = []
 
-        private let (lifetime, token) = Lifetime.make()
+        /// Subscriptions from the outside world.
+        private var subscriptionContext: SubscriptionContext = SubscriptionContext(eventSources: [])
 
-        init() {
-            childEvent
-                .flatMap(.latest, { $0 })
-                .take(during: lifetime)
-                .observe(on: QueueScheduler.workflowExecution)
-                .observeValues { [weak self] event in
-                    self?.handle(output: event)
-                }
-        }
+        init() {}
 
         /// Performs an update pass using the given closure.
         func render<Rendering>(_ actions: (RenderContext<WorkflowType>) -> Rendering) -> Rendering {
+
+            /// Invalidate the previous sinks.
+            for sink in sinks {
+                sink.invalidate()
+            }
 
             /// Create a workflow context containing the existing children
             let context = Context(
@@ -49,8 +48,16 @@ extension WorkflowNode {
             /// as a result of this call to `render`.
             self.childWorkflows = context.usedChildWorkflows
             self.childWorkers = context.usedChildWorkers
+            self.sinks = context.sinks
 
-            /// Finally, merge all of the events together from the new set of children and start listening to them
+            /// Enable and start listening to events from sinks, child workflows, and workers.
+            for sink in self.sinks {
+                sink.enable { [weak self] output in
+                    self?.handle(output: output)
+                }
+            }
+
+            /// Start listening to the child workflows and workers.
             for child in self.childWorkflows {
                 child.value.onUpdate = { [weak self] output in
                     self?.handle(output: output)
@@ -63,13 +70,11 @@ extension WorkflowNode {
                 }
             }
 
-            let eventSources = Signal
-                .merge(context.eventSources)
-                .map({ update in
-                    return Output.update(update, source: .external)
-                })
-
-            childEventObserver.send(value: eventSources)
+            /// Finally, merge all of the signals together from the subscriptions and start listening to them.
+            self.subscriptionContext = SubscriptionContext(eventSources: context.eventSources)
+            self.subscriptionContext.onUpdate = { [weak self] output in
+                self?.handle(output: output)
+            }
 
             /// Return the rendered result
             return rendering
@@ -109,6 +114,8 @@ extension WorkflowNode.SubtreeManager {
 
     /// The workflow context implementation used by the subtree manager.
     fileprivate final class Context: RenderContextType {
+
+        private (set) internal var sinks: [SinkContext]
         
         private let originalChildWorkflows: [ChildKey:AnyChildWorkflow]
         private (set) internal var usedChildWorkflows: [ChildKey:AnyChildWorkflow]
@@ -119,6 +126,8 @@ extension WorkflowNode.SubtreeManager {
         private (set) internal var eventSources: [Signal<AnyWorkflowAction<WorkflowType>, NoError>] = []
 
         internal init(originalChildWorkflows: [ChildKey:AnyChildWorkflow], originalChildWorkers: [AnyChildWorker]) {
+            self.sinks = []
+
             self.originalChildWorkflows = originalChildWorkflows
             self.usedChildWorkflows = [:]
 
@@ -167,6 +176,17 @@ extension WorkflowNode.SubtreeManager {
             return child.render()
         }
 
+        func makeSink<Action>(of actionType: Action.Type) -> Sink<Action> where Action : WorkflowAction, WorkflowType == Action.WorkflowType {
+
+            let sinkContext = SinkContext()
+
+            let sink = Sink<Action> { action in
+                sinkContext.handle(action: AnyWorkflowAction(action))
+            }
+            sinks.append(sinkContext)
+            return sink
+        }
+
         func subscribe<Action>(signal: Signal<Action, NoError>) where Action : WorkflowAction, WorkflowType == Action.WorkflowType {
             eventSources.append(signal.map { AnyWorkflowAction($0) })
         }
@@ -188,6 +208,46 @@ extension WorkflowNode.SubtreeManager {
         
     }
 
+}
+
+
+extension WorkflowNode.SubtreeManager {
+    fileprivate final class SinkContext {
+
+        var validationState: ValidationState
+        enum ValidationState {
+            case preparing
+            case valid(handler: (Output) -> Void)
+            case invalid
+        }
+
+        init() {
+            self.validationState = .preparing
+        }
+
+        func handle(action: AnyWorkflowAction<WorkflowType>) {
+            switch validationState {
+            case .preparing:
+                fatalError("Sink sent an action inside `render`. Sinks are not valid until `render` has completed.")
+            case .valid(handler: let handler):
+                let output = Output.update(action, source: .external)
+                handler(output)
+            case .invalid:
+                fatalError("Sink sent an action after it was invalidated. Sinks can only be used for a single valid `Rendering`.")
+            }
+        }
+
+        func enable(with handler: @escaping (Output) -> Void) {
+            guard case .preparing = validationState else {
+                fatalError("Attempted to enable a SinkContext that was not in the preparing state.")
+            }
+            validationState = .valid(handler: handler)
+        }
+
+        func invalidate() {
+            validationState = .invalid
+        }
+    }
 }
 
 extension WorkflowNode.SubtreeManager {
@@ -230,7 +290,7 @@ extension WorkflowNode.SubtreeManager {
 
         private var outputMap: (W.Output) -> AnyWorkflowAction<WorkflowType>
 
-        private var disposable: Disposable? = nil
+        private let (lifetime, token) = Lifetime.make()
 
         init(worker: W, outputMap: @escaping (W.Output) -> AnyWorkflowAction<WorkflowType>) {
             self.worker = worker
@@ -238,7 +298,8 @@ extension WorkflowNode.SubtreeManager {
             self.outputMap = outputMap
             super.init()
 
-            disposable = signalProducer
+            signalProducer
+                .take(during: lifetime)
                 .observe(on: QueueScheduler.workflowExecution)
                 .startWithValues { [weak self] output in
                     self?.handle(output: output)
@@ -258,10 +319,30 @@ extension WorkflowNode.SubtreeManager {
 
     }
 
-
-
-
 }
+
+
+extension WorkflowNode.SubtreeManager {
+    fileprivate final class SubscriptionContext {
+        var onUpdate: ((Output) -> Void)? = nil
+
+        private var (lifetime, token) = Lifetime.make()
+
+        init(eventSources: [Signal<AnyWorkflowAction<WorkflowType>, NoError>]) {
+            Signal
+                .merge(eventSources)
+                .map({ action -> Output in
+                    return Output.update(action, source: .external)
+                })
+                .observe(on: QueueScheduler.workflowExecution)
+                .take(during: lifetime)
+                .observeValues({ [weak self] output in
+                    self?.onUpdate?(output)
+                })
+        }
+    }
+}
+
 
 extension WorkflowNode.SubtreeManager {
 
@@ -327,5 +408,3 @@ extension WorkflowNode.SubtreeManager {
     
     
 }
-
-
